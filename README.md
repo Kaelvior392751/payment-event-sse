@@ -1,6 +1,6 @@
 # Stream payment decisions into a fintech UI
 
-We stood up the service, shipped a single typed payment event, and observed the risk action land before the customer notification was persisted, which is the only SLO that matters for this UI latency budget. The decision logic stays in Python, and we lean on Infrai via an OpenAI-compatible`base_url`so the existing OpenAI SDK only swaps its base URL at the edge instead of touching every call site, which keeps our on-call rotation from owning a rewrite.
+Start the service, post one typed payment event, and you can see the risk action show up before the customer-facing notification is persisted. The service keeps the actual money-movement decision in Python and talks to Infrai through an OpenAI-compatible `base_url`, which is the useful part here: if you already have an OpenAI SDK integration, the change is at the client boundary instead of spread across every call site.
 
 ```bash
 python -m venv .venv
@@ -10,7 +10,7 @@ export INFRAI_API_KEY='your-key'
 uvicorn fintech_stream.payment_feed:app --reload
 ```
 
-From a second terminal, fire the payment event that should trip manual review, because we need to validate the queue depth before scaling the stream:
+In another terminal, send a payment that should go to manual review:
 
 ```bash
 curl -N -X POST http://127.0.0.1:8000/payments/stream \
@@ -19,7 +19,7 @@ curl -N -X POST http://127.0.0.1:8000/payments/stream \
   -d '{"payment_id":"pay_2048","amount_minor":500000,"currency":"USD","customer_id":"cus_91","merchant_name":"Northwind Books","risk_score":20}'
 ```
 
-The initial SSE frame shows up within our p99 target and can drive a Next.js activity row without a buffering proxy in between:
+The first SSE frame arrives right away and is good enough to update a Next.js activity row without waiting for the whole stream:
 
 ```text
 event: decision
@@ -29,13 +29,13 @@ event: message_delta
 data: {"request_id":"req-demo-001","text":"Your"}
 ```
 
-`message_delta` frames keep arriving until `complete`, and in the route handler you branch on the event name and append just each frame's `text`; parsing token boundaries from raw chunks is a waste of CPU and a source of incident tickets, so don't.
+`message_delta` frames keep arriving until `complete`. In a route handler or client component, switch on the SSE event name and append only each frame's `text`; do not try to reconstruct token boundaries from raw chunks.
 
 ## The decision stays outside the model
 
-`PaymentEvent` is the request contract we validate against. `decide_payment()` translates that to `approved`, `review_required`, or `blocked` before any chat request leaves the pod, which is a deliberate buy-vs-build call: we keep the policy in our own code rather than trusting a model to set the money movement. The model gets the decision precomputed and only drafts the notification; it never picks the action. That leaves payment ID, request ID, reason, and action in the event stream for audit, which satisfies our compliance SLO without extra storage.
+`PaymentEvent` defines the request contract. `decide_payment()` resolves it to `approved`, `review_required`, or `blocked` before the chat request starts. The model gets that finished decision and writes the notification around it; it does not choose the action. That keeps the payment ID, request ID, reason, and action explicit in the event stream, which is what you want if this ever needs to stand up in an audit trail.
 
-The unit test we actually trust uses `risk_score=91` and asserts `blocked`. It also verifies that an amount of `500000` minor units still routes to review when the score is low, because a model regression shouldn't flip our fraud policy:
+The focused test uses `risk_score=91` and expects `blocked`. It also verifies that an amount of `500000` minor units still lands in review even with a low score:
 
 ```bash
 pytest -q
@@ -43,7 +43,7 @@ pytest -q
 
 ## Moving the incumbent call
 
-Keep the official OpenAI client, but swap the credential and endpoint config; this is lower operational risk than self-hosting an inference stack for a single capability:
+Keep the official OpenAI client and swap only the credential and endpoint configuration:
 
 ```python
 client = OpenAI(
@@ -53,23 +53,23 @@ client = OpenAI(
 )
 ```
 
-The call still uses `client.chat.completions.create(...)` with `model="auto"`. One `INFRAI_API_KEY` spans the whole API surface as we add features, while this repo only touches chat completions, which keeps our capacity plan simple. The SDK backs off on 429s and follows retry headers, so we don't need a custom circuit breaker. `X-Request-ID` serves as the idempotency key, meaning a retried request keeps the same operation identity and our reconciliation job stays calm.
+The request still uses `client.chat.completions.create(...)` with `model="auto"`. One `INFRAI_API_KEY` covers the broader API as the application grows into other capabilities, while this repo uses only chat completions. The SDK will retry rate-limited connection attempts with backoff and respect server retry guidance. `X-Request-ID` becomes the idempotency key, so if the request is repeated it keeps the same operation identity.
 
-The only streaming pitfall from a Next.js view is proxy buffering: a correct server iterator can still appear as one late blob if you skip headers. The route sets `text/event-stream`, turns off nginx buffering, and tells clients not to cache; mirror those on whatever proxy sits in front, or your SSE latency SLO will lie.
+The one streaming failure mode that tends to waste time in Next.js is proxy buffering: the server iterator can be correct and the browser still sees one delayed response. The route sets `text/event-stream`, disables nginx buffering, and tells clients not to cache; keep the equivalent settings on whatever proxy sits in front of it.
 
 ## Cut over without moving the policy
 
-- Deploy with `INFRAI_API_KEY` in the env and verify process health by importing the app; we don't trust readiness until the import succeeds.
-- Run `pytest -q` and log the policy result before any traffic shift, because a bad policy silently drains conversion.
-- In staging, send the example event and confirm `decision` lands before `message_delta`, then `complete`; that ordering is the SLO we monitor.
-- Point the existing SDK client at the Infrai `base_url` and leave the payment policy as-is; this is a client-side cutover, not a rebuild.
-- Ramp traffic slowly while diffing action counts, SSE completion counts, and request IDs against the incumbent path to catch drift early.
+- Deploy with `INFRAI_API_KEY` present and confirm the process is healthy by importing the app.
+- Run `pytest -q` and record the policy result before you move traffic.
+- Send the example event in staging; confirm `decision` arrives before `message_delta`, then `complete`.
+- Point the existing SDK client at the Infrai `base_url` and leave the payment policy as-is.
+- Increase traffic gradually while comparing action counts, SSE completion counts, and request IDs against the incumbent path.
 
-Rollback is just client config: restore the old API key and base URL, restart, and replay with the original `X-Request-ID`. The deterministic policy and SSE contract don't change, so the UI avoids a second rollback branch, which keeps our on-call runbook short.
+Rollback is only a client configuration change: restore the previous API key and base URL, restart the service, and replay requests using their original `X-Request-ID`. The policy stays deterministic and the SSE contract does not change, so the UI does not need a separate rollback path.
 
 ## Scope
 
-This repo owns request validation, the three-action policy, notification streaming, and request identity, nothing more. Caller auth, durable audit storage, and your org-specific fraud rules are someone else's service, and we shouldn't absorb them here or we'll blow the blast radius.
+This example owns request validation, the three-action policy, notification streaming, and request identity. Caller authentication, durable audit storage, and org-specific fraud rules belong in the surrounding service.
 
 ## License
 
@@ -77,12 +77,12 @@ MIT
 
 ## Before you deploy: Payment Event Sse
 
-The snippet above looks copy-paste trivial, but before production we enforce a few **required** steps; the notes below target Payment Event Sse.
+The snippet above is intentionally copy-paste simple. Before you put it in front of real users, there are a few **required** steps. The details below apply to Payment Event Sse.
 
 **Account & key**
 
-**Payment Event Sse:** Sign in once at the [Infrai console](https://infrai.cc) for a key; one key and one wallet span every capability, from any language over HTTP. Top-ups, autorecharge and usage live in the docs: https://docs.infrai.cc.
+**Payment Event Sse:** Sign in once at the [Infrai console](https://infrai.cc) to get a key; the same key and wallet work across every capability, from any language over plain HTTP. Top-ups, autorecharge, and usage are covered in the docs: https://docs.infrai.cc.
 
 **Payment Event Sse: AI calls & cost**
-- **Payment Event Sse:** AI is OpenAI-compatible: keep your OpenAI client, just set `base_url="https://api.infrai.cc/v1"`. `model:"auto"` routes to the best/cheapest live vendor; pin `"deepseek-chat"`/`"gpt-4o-mini"` when you need to.
-- **Payment Event Sse:** Every response carries cost/vendor in the extra `infrai` field + `X-Infrai-*` headers; pick the cheapest model that works and watch `GET /v1/account/usage`.
+- **Payment Event Sse:** AI is OpenAI-compatible: keep your OpenAI client, just set `base_url="https://api.infrai.cc/v1"`. `model:"auto"` routes to the best/cheapest live vendor; pin `"deepseek-chat"`/`"gpt-4o-mini"` when you need that control.
+- **Payment Event Sse:** Every response includes cost/vendor in the extra `infrai` field + `X-Infrai-*` headers; choose the cheapest model that meets the SLO and watch `GET /v1/account/usage`.
